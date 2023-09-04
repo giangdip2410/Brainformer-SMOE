@@ -13,17 +13,17 @@ import random
 import torch
 
 
-def _train_step(model, X, Y, h_cache, eval_only, cur_step, logging, loss_div=1):
+def _train_step(
+    model, X, Y, h_cache, eval_only, cur_step, logging, cnt_step, loss_div=1
+):
     """Single training step."""
     out, h_cache = model(X, h_cache)
     out = out.view(-1, out.size(-1))
     loss = torch.nn.functional.nll_loss(out, Y.view(-1))
     loss_value = loss.item() / loss_div
-    log_str = "|Step {:>8d} " "| loss {:5.2f} | BPC {:5.2f}".format(
-        cur_step, loss_value, loss_value / math.log(2)
-    )
-    logging(log_str)
-    cur_step += 1
+
+    if cnt_step:
+        cur_step += 1
     if not eval_only:
         # loss term from adaptive-span
         if model.module.layers[0].attn.attn.adapt_span_enabled:
@@ -48,6 +48,7 @@ def _train_batch(
     batch_split,
     cur_step,
     logging,
+    cnt_step,
 ):
     """Train on a batch."""
 
@@ -56,7 +57,7 @@ def _train_batch(
     if batch_split == 1:
         # process a batch in a single step (default behaviour)
         loss_value, h_cache, cur_step = _train_step(
-            model, X, Y, h_cache, eval_only, cur_step, logging
+            model, X, Y, h_cache, eval_only, cur_step, logging, cnt_step
         )
     else:
         # split a batch into multiple pieces that each can fit in memory
@@ -73,10 +74,10 @@ def _train_batch(
                 Y=Y[split_slice],
                 h_cache=split_h_cache,
                 eval_only=eval_only,
-                # batch_split,
                 cur_step=cur_step,
                 logging=logging,
                 loss_div=batch_split,
+                cnt_step=cnt_step,
             )
             loss_value += split_loss_value
             h_cache_list.append(split_h_cache)
@@ -112,12 +113,15 @@ def train_iteration(
     batch_split,
     cur_step,
     logging,
+    cnt_step=False,
 ):
     """Single training iteration."""
     if eval_only:
         model.eval()
+        cnt_step = False
     else:
         model.train()
+        cnt_step = True
 
     nb_batches_per_iter_max = nb_batches_per_iter
     if eval_only:
@@ -145,6 +149,7 @@ def train_iteration(
             batch_split=batch_split,
             cur_step=cur_step,
             logging=logging,
+            cnt_step=cnt_step,
         )
         loss_all += loss
         train_pos += block_size
@@ -156,7 +161,7 @@ def train_iteration(
                 h.fill_(0)
 
     loss_all = loss_all / actual_nb_batches_per_iter
-    return loss_all, train_pos, h_cache
+    return loss_all, train_pos, h_cache, cur_step
 
 
 # do full evaluation
@@ -169,6 +174,7 @@ def full_eval(
     hidden_size,
     cur_step,
     logging,
+    cnt_step=False,
 ):
     model.eval()
     train_pos = 0
@@ -200,6 +206,7 @@ def full_eval(
             batch_split=1,
             cur_step=cur_step,
             logging=logging,
+            cnt_step=cnt_step,
         )
         loss_all += loss
         train_pos += block_size

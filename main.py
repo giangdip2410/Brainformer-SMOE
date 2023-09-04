@@ -9,9 +9,11 @@
 
 import math
 import time
-
+import random
+import numpy as np
 import torch
 import datetime
+import itertools
 
 from config import PARAMS_CONFIG
 from data import get_train_val_test_data
@@ -26,6 +28,8 @@ from utils import (
     create_exp_dir,
     Logger,
 )
+from tqdm import tqdm
+from new_utils import train_gate, args_moe, adjust_moe_gate_number
 
 
 def launch(
@@ -35,8 +39,10 @@ def launch(
     optim_params,
     data_params,
     trainer_params,
+    args_moe=args_moe,
 ):
     # ENVIRONMENT (device, distributed, etc.)
+    global train_step, current_gate, best_val_loss
     set_up_env(env_params)
     device = env_params["device"]
     distributed = env_params["distributed"]
@@ -79,11 +85,8 @@ def launch(
         model=model, optim_params=optim_params
     )
     # Freeze gate
-    freeze_gate = False
-    if freeze_gate:
-        for name, p in model.named_parameters():
-            if "gate.gate" in name:
-                p.requires_grad = False
+    if model_params["policy"] != "smoe":
+        train_gate(model, train_gate=False)
     # create logger
     logger = Logger()
     fold_name = trainer_params["checkpoint_path"].split("/")[-1].split(".")[0]
@@ -95,10 +98,6 @@ def launch(
     logging(str(current_time))
     # log model
     logging(str(model))
-    # for name, param in model.named_parameters():
-    #     if param.requires_grad:
-    #         if 'hypernet' in name:
-    #             param.requires_grad = False
     logging(f"Total of Prams: {sum(p.numel() for p in model.parameters())}")
     logging(
         f"Total of Trainable Prams: {sum(p.numel() for p in model.parameters() if p.requires_grad)}"
@@ -113,7 +112,8 @@ def launch(
         logger,
         distributed,
     )
-    cur_step = 0
+    # cur_step = 0
+    start_time = time.time()
     if trainer_params["full_eval_mode"]:
         # evaluate the model on test data
         with torch.no_grad():
@@ -124,7 +124,7 @@ def launch(
                 val_data,
                 model_params["block_size"],
                 model_params["hidden_size"],
-                cur_step=cur_step,
+                cur_step=train_step,
                 logging=logging,
             )
             loss_test = full_eval(
@@ -134,7 +134,7 @@ def launch(
                 test_data,
                 model_params["block_size"],
                 model_params["hidden_size"],
-                cur_step=cur_step,
+                cur_step=train_step,
                 logging=logging,
             )
             if distributed:
@@ -146,11 +146,14 @@ def launch(
                     loss_test = stats[1] / env_params["world_size"]
                 else:
                     return
+    
+            if  ('enwik8' in data_params['data_path']) or ('text8' in data_params['data_path']):
+                logging("Val: {:.3f} BPC".format(loss_val / math.log(2)))
+                logging("Test: {:.3f} BPC".format(loss_test / math.log(2)))
+            else:
+                logging("Val: {:.3f} PPL".format(math.exp(loss_val)))
+                logging("Test: {:.3f} PPL".format(math.exp(loss_test)))
 
-            # print("val: {:.3f}bpc".format(loss_val / math.log(2)))
-            # print("test: {:.3f}bpc".format(loss_test / math.log(2)))
-            logging("val: {:.3f} BPC".format(loss_val / math.log(2)))
-            logging("test: {:.3f} BPC".format(loss_test / math.log(2)))
         return
 
     # position of current batch
@@ -167,13 +170,19 @@ def launch(
         ]
         for _ in range(2)
     ]
-
+    # config
     nb_batches_per_iter = trainer_params["nb_batches_per_iter"]
-    cur_step = 0
-    # max_step = trainer_params["max_step"]
-    for iter_no in range(iter_init, trainer_params["nb_iter"]):
+    args_moe.dynamic_overall_steps = trainer_params["maxstep"]
+    max_epoch = int(trainer_params["maxstep"] / (nb_batches_per_iter *trainer_params["batch_split"]) )
+    current_gate = 2  # select 2 topk
+    # training
+    for epoch in tqdm(range(iter_init, max_epoch)):
         t_sta = time.time()
-        loss_train, data_pos[0], hid_cache[0] = train_iteration(
+        if model_params["policy"] != "smoe":
+            current_gate = adjust_moe_gate_number(
+                model, train_step, args_moe, current_gate
+            )
+        loss_train, data_pos[0], hid_cache[0], train_step = train_iteration(
             model,
             optimizer,
             scheduler,
@@ -184,24 +193,14 @@ def launch(
             data_pos[0],
             hid_cache[0],
             trainer_params["batch_split"],
-            cur_step,
+            train_step,
             logging,
-            # max_step,
+            cnt_step=True,
         )
-        # logging(
-        #     "Iter: {0:5d}  | Train Loss: {:.3f} | Train BPC: {:.3f}bpc".format(
-        #         iter_no, loss_train, loss_train / math.log(2)
-        #     )
-        # )
-        logging("=================== VALIDATION ======================")
-        log_str = "|Step {:>8d} " "| loss {:5.2f} | BPC {:5.2f}".format(
-            iter_no, loss_train, loss_train / math.log(2)
-        )
-        logging(log_str)
 
         elapsed = 1000 * (time.time() - t_sta) / nb_batches_per_iter
         with torch.no_grad():
-            loss_val, data_pos[1], hid_cache[1] = train_iteration(
+            loss_val, data_pos[1], hid_cache[1], _ = train_iteration(
                 model,
                 optimizer,
                 scheduler,
@@ -212,18 +211,10 @@ def launch(
                 data_pos[1],
                 hid_cache[1],
                 trainer_params["batch_split"],
-                cur_step=cur_step,
+                cur_step=train_step,
                 logging=logging,
+                cnt_step=False,
             )
-            # logging(
-            #     "Iter: {0:5d}  | Val Loss: {:.3f} | Val BPC: {:.3f}bpc".format(
-            #         iter_no, loss_val, loss_val / math.log(2)
-            #     )
-            # )
-            log_str = "|Step {:>8d} " "| loss {:5.2f} | BPC {:5.2f}".format(
-                iter_no, loss_val, loss_val / math.log(2)
-            )
-            logging(log_str)
 
         if distributed:
             # collect results into rank0
@@ -234,19 +225,37 @@ def launch(
                 loss_val = stats[1] / env_params["world_size"]
             else:
                 continue
-        logging(f"=================== ITERATION {iter_no} ======================")
+        logging(f"=================== EPOCHS {epoch} ======================")
+        if  ('enwik8' in data_params['data_path']) or ('text8' in data_params['data_path']):
+            logging(
+                f"Epochs: {epoch} | Steps: {train_step} | Batchs: {nb_batches_per_iter}| loss_train: {loss_train} | loss_val: {loss_val} | bpc_train: {loss_train / math.log(2)} | bpc_val: {loss_val / math.log(2)} | elapsed: {elapsed}"
+            )
+        else:
+            logging(
+                f"Epochs: {epoch} | Steps: {train_step} | Batchs: {nb_batches_per_iter}| loss_train: {loss_train} | loss_val: {loss_val} | ppl_train: {math.exp(loss_train)} | ppl_val: {math.exp(loss_val)} | elapsed: {elapsed}"
+            )
         logger.log_iter(
-            iter_no, nb_batches_per_iter, loss_train, loss_val, elapsed, model
+            epoch, nb_batches_per_iter, loss_train, loss_val, elapsed, model
         )
-        save_checkpoint(
-            trainer_params["checkpoint_path"],
-            iter_no,
-            model,
-            optimizer,
-            scheduler,
-            logger,
-        )
+        # Save the model if the validation loss is the best we've seen so far.
+        if (best_val_loss is None) or loss_val < best_val_loss:
+            best_val_loss = loss_val
+            save_checkpoint(
+                trainer_params["checkpoint_path"],
+                epoch,
+                model,
+                optimizer,
+                scheduler,
+                logger,
+            )
+        if train_step == trainer_params["maxstep"]:
+            break
+    end_time = time.time()
+    logging(f"Training time total: {(end_time - start_time)/3600} h")
 
 
 if __name__ == "__main__":
+    # Loop over epochs.
+    train_step = 0
+    best_val_loss = None
     launch(**get_params(params_config=PARAMS_CONFIG))

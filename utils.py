@@ -255,4 +255,4 @@ class Logger:
             self._log("span_max", span_max)
             msg += "\tspan_avg: {:.0f}\tspan_max: {:.0f}".format(span_avg, span_max)
 
-        print(msg)
+        # print(msg)
